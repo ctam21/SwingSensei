@@ -1,0 +1,24 @@
+# Xcode
+DerivedData/
+*.xcuserstate
+**/xcuserdata/
+*.xcuserdatad
+.DS_Store
+
+# Workspaces
+*.xcworkspace
+
+# Builds
+build/
+
+# CocoaPods (do not commit Pods binaries)
+Pods/
+
+# SwiftPM
+.swiftpm/
+
+# Local envs and large artifacts
+.vpose_env/
+lifter_server/venv/
+onnx/
+VideoPose3D/
