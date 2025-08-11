@@ -248,11 +248,22 @@ struct ContentView: View {
     @State private var videoDuration: Double = 0.0
     @State private var estimatedTimeRemaining: Double = 0.0
     @State private var currentFrameIndex: Int = 0
-    @State private var swingAnalysis: SwingAnalysis?
+    // Phase analysis removed
     // Enhanced wrist assistance is always ON (no user toggle)
     @State private var detectedFrames: [(image: UIImage, joints: [Int: CGPoint])] = []
     @State private var fusionCount: Int = 0
     @State private var handModelReady: Bool = false
+    // New: detectors and tracker
+    private let clubKP = ClubKeypointDetector()
+    private let ballDetector = BallDetector()
+    @State private var clubTracker = MultiPointKalman(dt: 1.0/20.0)
+    // Performance tuning
+    private let analysisFPS: Double = 12.0
+    private let ciContextShared = CIContext()
+    // Phase labeling for dataset export
+    enum PhaseName: String, CaseIterable { case address, takeaway, midBackswing, top, midDownswing, impact, followThrough, finish }
+    struct PhaseLabels { var address: Int?; var takeaway: Int?; var midBackswing: Int?; var top: Int?; var midDownswing: Int?; var impact: Int?; var followThrough: Int?; var finish: Int? }
+    @State private var phaseLabels = PhaseLabels()
 
     var body: some View {
             ZStack {
@@ -356,8 +367,37 @@ struct ContentView: View {
                                     AnalysisCompleteView(
                                         analyzedFrames: analyzedFrames,
                                         currentFrameIndex: $currentFrameIndex,
-                                        analysis: swingAnalysis,
-                                        lifterStatusText: nil
+                                        lifterStatusText: nil,
+                                        phaseDone: [
+                                            .address: phaseLabels.address != nil,
+                                            .takeaway: phaseLabels.takeaway != nil,
+                                            .midBackswing: phaseLabels.midBackswing != nil,
+                                            .top: phaseLabels.top != nil,
+                                            .midDownswing: phaseLabels.midDownswing != nil,
+                                            .impact: phaseLabels.impact != nil,
+                                            .followThrough: phaseLabels.followThrough != nil,
+                                            .finish: phaseLabels.finish != nil
+                                        ],
+                                        onMarkPhase: { phase in
+                                            markPhase(phase)
+                                        },
+                                        onExport: {
+                                            exportCurrentAnalysis()
+                                        },
+                                        onAnalyzeAnother: {
+                                            // Reset state and open picker again
+                                            selectedVideoURL = nil
+                                            analyzedFrames = []
+                                            detectedFrames = []
+                                            fusionCount = 0
+                                            processingProgress = 0
+                                            processedFrames = 0
+                                            totalFrames = 0
+                                            videoDuration = 0
+                                            estimatedTimeRemaining = 0
+                                            currentFrameIndex = 0
+                                            showVideoPicker = true
+                                        }
                                     )
                                     // Toggles removed; Enhanced is always on
                                 }
@@ -389,12 +429,12 @@ struct ContentView: View {
                         handModelReady = await handWrapper.prepareIfNeeded()
                         // Temporal lifter removed
                         // Set video info directly
-                        let asset = AVURLAsset(url: selectedURL)
+                let asset = AVURLAsset(url: selectedURL)
                         do {
                             let duration = try await asset.load(.duration)
                             let durationSeconds = CMTimeGetSeconds(duration)
-                            videoDuration = durationSeconds
-                            totalFrames = Int(durationSeconds * 20) // 20 FPS
+                    videoDuration = durationSeconds
+                    totalFrames = Int(durationSeconds * analysisFPS)
                             estimatedTimeRemaining = durationSeconds * 0.8 // Rough estimate
                         } catch {
                             print("Error loading video info: \(error)")
@@ -413,6 +453,102 @@ struct ContentView: View {
         let remainingSeconds = Int(seconds) % 60
         return String(format: "%d:%02d", minutes, remainingSeconds)
     }
+
+    // MARK: - Phase labeling and export
+    extension ContentView {
+        fileprivate func markPhase(_ phase: PhaseName) {
+            switch phase {
+            case .address: phaseLabels.address = currentFrameIndex
+            case .takeaway: phaseLabels.takeaway = currentFrameIndex
+            case .midBackswing: phaseLabels.midBackswing = currentFrameIndex
+            case .top: phaseLabels.top = currentFrameIndex
+            case .midDownswing: phaseLabels.midDownswing = currentFrameIndex
+            case .impact: phaseLabels.impact = currentFrameIndex
+            case .followThrough: phaseLabels.followThrough = currentFrameIndex
+            case .finish: phaseLabels.finish = currentFrameIndex
+            }
+        }
+
+        fileprivate func exportCurrentAnalysis() {
+            guard !analyzedFrames.isEmpty else { return }
+            func mid(_ a: CGPoint, _ b: CGPoint) -> CGPoint { CGPoint(x: (a.x + b.x) * 0.5, y: (a.y + b.y) * 0.5) }
+            var features: [[Double]] = []
+            var prevNorm: [CGPoint]? = nil
+            for f in analyzedFrames {
+                let j = f.joints
+                let hipL = j[23] ?? .zero
+                let hipR = j[24] ?? .zero
+                let shL = j[11] ?? .zero
+                let shR = j[12] ?? .zero
+                let c = mid(hipL, hipR)
+                let s = max(1e-3, hypot(shR.x - shL.x, shR.y - shL.y))
+                var row: [Double] = []
+                var curNorm: [CGPoint] = []
+                for idx in 0..<33 {
+                    if let p = j[idx] {
+                        let nx = (p.x - c.x)/s
+                        let ny = (p.y - c.y)/s
+                        curNorm.append(CGPoint(x: nx, y: ny))
+                    } else { curNorm.append(.zero) }
+                }
+                // Light smoothing
+                if let prev = prevNorm {
+                    let alpha: CGFloat = 0.2
+                    for i in 0..<33 {
+                        curNorm[i] = CGPoint(
+                            x: prev[i].x + alpha * (curNorm[i].x - prev[i].x),
+                            y: prev[i].y + alpha * (curNorm[i].y - prev[i].y)
+                        )
+                    }
+                }
+                // XY
+                for i in 0..<33 { row.append(Double(curNorm[i].x)); row.append(Double(curNorm[i].y)) }
+                // Velocities
+                if let prev = prevNorm {
+                    for i in 0..<33 {
+                        let vx = (curNorm[i].x - prev[i].x) * CGFloat(analysisFPS)
+                        let vy = (curNorm[i].y - prev[i].y) * CGFloat(analysisFPS)
+                        row.append(Double(vx)); row.append(Double(vy))
+                    }
+                } else {
+                    for _ in 0..<33 { row.append(0); row.append(0) }
+                }
+                // Simple angles (elbow/wrist)
+                func ang(_ a: CGPoint, _ b: CGPoint) -> Double { Double(atan2(a.y - b.y, a.x - b.x)) }
+                let lEl = curNorm[13], lWr = curNorm[15], lShN = curNorm[11]
+                let rEl = curNorm[14], rWr = curNorm[16], rShN = curNorm[12]
+                row.append(ang(lEl, lShN)); row.append(ang(lWr, lEl)); row.append(ang(rEl, rShN)); row.append(ang(rWr, rEl))
+                prevNorm = curNorm
+                features.append(row)
+            }
+            let phases: [String: Int] = [
+                "address": phaseLabels.address ?? 0,
+                "takeaway": phaseLabels.takeaway ?? max(0, analyzedFrames.count/12),
+                "midBackswing": phaseLabels.midBackswing ?? max(0, analyzedFrames.count/6),
+                "top": phaseLabels.top ?? max(0, analyzedFrames.count/3),
+                "midDownswing": phaseLabels.midDownswing ?? max(0, analyzedFrames.count/2),
+                "impact": phaseLabels.impact ?? max(0, analyzedFrames.count*2/3),
+                "followThrough": phaseLabels.followThrough ?? max(0, analyzedFrames.count*5/6),
+                "finish": phaseLabels.finish ?? max(0, analyzedFrames.count-1)
+            ]
+            let payload: [String: Any] = [
+                "fps": analysisFPS,
+                "numFrames": analyzedFrames.count,
+                "features": features,
+                "phases": phases
+            ]
+            do {
+                let data = try JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted])
+                let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
+                let url = dir.appendingPathComponent("swing_features_\(Int(Date().timeIntervalSince1970)).json")
+                try data.write(to: url)
+                print("✅ Exported features: \(url.path)")
+            } catch {
+                print("❌ Export failed: \(error)")
+            }
+        }
+    }
+
 
 // MARK: - Processing View
 struct ProcessingView: View {
@@ -474,9 +610,14 @@ struct ProcessingView: View {
 struct AnalysisCompleteView: View {
     let analyzedFrames: [(image: UIImage, joints: [Int: CGPoint])]
     @Binding var currentFrameIndex: Int
-    let analysis: SwingAnalysis? // deprecated (kept to avoid larger refactor)
     // Debug lifter status text (optional)
     let lifterStatusText: String?
+    let phaseDone: [ContentView.PhaseName: Bool]
+    let onMarkPhase: (ContentView.PhaseName) -> Void
+    let onExport: () -> Void
+    let onAnalyzeAnother: () -> Void
+    @State private var showToast: Bool = false
+    @State private var toastText: String = ""
 
     var body: some View {
         VStack(spacing: 16) {
@@ -514,8 +655,52 @@ struct AnalysisCompleteView: View {
                     #endif
                     
                     FrameSlider(count: analyzedFrames.count, index: $currentFrameIndex)
-                    
-            // Scorecard and phase buttons removed per request
+                    // Phase markers and export controls
+                    Menu("Mark Phase") {
+                        Button("Address") { mark(.address) }
+                        Button("Takeaway") { mark(.takeaway) }
+                        Button("Mid-Backswing") { mark(.midBackswing) }
+                        Button("Top") { mark(.top) }
+                        Button("Mid-Downswing") { mark(.midDownswing) }
+                        Button("Impact") { mark(.impact) }
+                        Button("Follow-Through") { mark(.followThrough) }
+                        Button("Finish") { mark(.finish) }
+                    }
+                    .buttonStyle(.bordered)
+                    // Also keep a horizontally scrollable strip for quick taps
+                                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 8) {
+                            Button("Address") { mark(.address) }
+                            Button("Takeaway") { mark(.takeaway) }
+                            Button("Mid-Back") { mark(.midBackswing) }
+                            Button("Top") { mark(.top) }
+                            Button("Mid-Down") { mark(.midDownswing) }
+                            Button("Impact") { mark(.impact) }
+                            Button("Follow") { mark(.followThrough) }
+                            Button("Finish") { mark(.finish) }
+                        }
+                        .buttonStyle(.bordered)
+                        .padding(.vertical, 4)
+                        .contentShape(Rectangle())
+                        .allowsHitTesting(true)
+                    }
+                    // Checklist view
+                    VStack(spacing: 6) {
+                        HStack(spacing: 10) {
+                            phaseBadge("Address", done: phaseDone[.address] ?? false)
+                            phaseBadge("Takeaway", done: phaseDone[.takeaway] ?? false)
+                            phaseBadge("Mid-Back", done: phaseDone[.midBackswing] ?? false)
+                            phaseBadge("Top", done: phaseDone[.top] ?? false)
+                        }
+                        HStack(spacing: 10) {
+                            phaseBadge("Mid-Down", done: phaseDone[.midDownswing] ?? false)
+                            phaseBadge("Impact", done: phaseDone[.impact] ?? false)
+                            phaseBadge("Follow", done: phaseDone[.followThrough] ?? false)
+                            phaseBadge("Finish", done: phaseDone[.finish] ?? false)
+                        }
+                    }
+                    Button("Export Features JSON") { onExport() }
+                        .buttonStyle(.bordered)
                     
                     // Frame Navigation
                     HStack(spacing: 20) {
@@ -546,6 +731,30 @@ struct AnalysisCompleteView: View {
                         }
                         .disabled(currentFrameIndex >= analyzedFrames.count - 1)
                     }
+                    // Phase auto-play removed
+                }
+            }
+            // Analyze Another Video button
+            Button(action: { onAnalyzeAnother() }) {
+                Text("Analyze Another Video")
+                    .font(.headline)
+                    .padding(.vertical, 10)
+                    .padding(.horizontal, 20)
+                    .background(Color.turf)
+                    .foregroundColor(.white)
+                    .clipShape(RoundedRectangle(cornerRadius: 12))
+            }
+            .buttonStyle(PressableButtonStyle())
+            // Toast overlay
+            .overlay(alignment: .top) {
+                if showToast {
+                    Text(toastText)
+                        .font(.caption)
+                        .padding(8)
+                        .background(RoundedRectangle(cornerRadius: 8).fill(Color.black.opacity(0.75)))
+                        .foregroundColor(.white)
+                        .padding(.top, 8)
+                        .transition(.move(edge: .top).combined(with: .opacity))
                 }
             }
         }
@@ -555,6 +764,40 @@ struct AnalysisCompleteView: View {
                 .fill(Color.white.opacity(0.9))
                 .shadow(color: Color.black.opacity(0.1), radius: 8, x: 0, y: 4)
         )
+    }
+
+    private func mark(_ phase: ContentView.PhaseName) {
+        onMarkPhase(phase)
+        toastText = "Set \(label(for: phase)) at frame \(currentFrameIndex + 1)"
+        withAnimation { showToast = true }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
+            withAnimation { showToast = false }
+        }
+    }
+
+    private func label(for phase: ContentView.PhaseName) -> String {
+        switch phase {
+        case .address: return "Address"
+        case .takeaway: return "Takeaway"
+        case .midBackswing: return "Mid-Backswing"
+        case .top: return "Top"
+        case .midDownswing: return "Mid-Downswing"
+        case .impact: return "Impact"
+        case .followThrough: return "Follow-Through"
+        case .finish: return "Finish"
+        }
+    }
+
+    @ViewBuilder private func phaseBadge(_ text: String, done: Bool) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: done ? "checkmark.circle.fill" : "circle")
+                .foregroundColor(done ? .green : .gray)
+            Text(text).font(.caption)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .background(RoundedRectangle(cornerRadius: 10).fill(Color.white.opacity(0.9)))
+        .overlay(RoundedRectangle(cornerRadius: 10).stroke(done ? Color.green.opacity(0.6) : Color.gray.opacity(0.3)))
     }
 }
 
@@ -658,7 +901,7 @@ extension ContentView {
             let wristGapFilled = fillWristGaps(frames: raw, maxGap: 3)
             let idFixed = enforceArmIdentity(frames: wristGapFilled)
             handModelReady = await handWrapper.prepareIfNeeded()
-            let wristsRefined = refineWristsWithHandsKalman(frames: idFixed, fps: 20)
+            let wristsRefined = refineWristsWithHandsKalmanKF(frames: idFixed, fps: CGFloat(analysisFPS))
             let withCue = nudgeWristsWithClubCue(frames: wristsRefined, fps: 20)
             let stabilized = stabilizeLowLag(frames: withCue, fps: 20)
             let finalFrames = stabilized.isEmpty ? withCue : stabilized
@@ -673,10 +916,8 @@ extension ContentView {
             }
             fusionCount = fused
             let liftedFrames = finalFrames
-            let computedAnalysis: SwingAnalysis? = nil
             await MainActor.run {
                 analyzedFrames = liftedFrames
-                swingAnalysis = computedAnalysis
                 currentFrameIndex = min(currentFrameIndex, max(liftedFrames.count - 1, 0))
             }
         }
@@ -726,9 +967,10 @@ extension ContentView {
                 reader.add(output)
                 reader.startReading()
 
-                let interval = CMTimeMakeWithSeconds(0.05, preferredTimescale: 600)
+                let interval = CMTimeMakeWithSeconds(1.0/analysisFPS, preferredTimescale: 600)
         var currentTime = CMTime.zero
         let startTime = Date()
+        var frameIndex = 0
         
         while let sampleBuffer = output.copyNextSampleBuffer() {
                         let presentationTime = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
@@ -738,17 +980,24 @@ extension ContentView {
                     var ciImage = CIImage(cvPixelBuffer: imageBuffer)
                     ciImage = ciImage.oriented(forExifOrientation: 6)
 
-                        let context = CIContext()
-                    guard let cgImage = context.createCGImage(ciImage, from: ciImage.extent) else { continue }
+                    guard let cgImage = ciContextShared.createCGImage(ciImage, from: ciImage.extent) else { continue }
                     
                             let uiImage = UIImage(cgImage: cgImage)
                     _ = CGSize(width: uiImage.size.width, height: uiImage.size.height)
                     
                     if let landmarks = poseWrapper.detectPose(in: uiImage) {
-                        analyzedFrames.append((image: uiImage, joints: landmarks))
+                        var joints = landmarks
+                        // Club/ball detection (best-effort); use hands to define ROI
+                        if let lw = joints[15], let rw = joints[16] {
+                            let handCenter = CGPoint(x: (lw.x + rw.x) * 0.5, y: (lw.y + rw.y) * 0.5)
+                            let roi = CGRect(x: handCenter.x - 180, y: handCenter.y - 180, width: 360, height: 360)
+                            // Club/ball overlays removed for now
+                        }
+                        analyzedFrames.append((image: uiImage, joints: joints))
                     }
                     
                     processedFrames += 1
+                    frameIndex += 1
                     // Clamp to avoid off-by-one display and out-of-bounds progress
                     if processedFrames > totalFrames { processedFrames = totalFrames }
                     if totalFrames > 0 {
@@ -765,9 +1014,7 @@ extension ContentView {
                         estimatedTimeRemaining = Double(remainingFrames) * timePerFrame
                     }
                     
-                        await MainActor.run {
-                        // Update UI on main thread
-                    }
+                    if frameIndex % 24 == 0 { await Task.yield() }
                 }
                 
                 currentTime = CMTimeAdd(currentTime, interval)
@@ -780,7 +1027,7 @@ extension ContentView {
         let wristGapFilled = fillWristGaps(frames: raw, maxGap: 3)
         let idFixed = enforceArmIdentity(frames: wristGapFilled)
         handModelReady = await handWrapper.prepareIfNeeded()
-        let wristsRefined = refineWristsWithHandsKalman(frames: idFixed, fps: 20)
+        let wristsRefined = refineWristsWithHandsKalmanKF(frames: idFixed, fps: CGFloat(analysisFPS))
         let withCue = nudgeWristsWithClubCue(frames: wristsRefined, fps: 20)
         let stabilized = stabilizeLowLag(frames: withCue, fps: 20)
         let finalFrames: [(image: UIImage, joints: [Int: CGPoint])] = stabilized.isEmpty ? withCue : stabilized
@@ -794,11 +1041,9 @@ extension ContentView {
         }
         fusionCount = fused
         let liftedFrames = finalFrames
-            let computedAnalysis: SwingAnalysis? = nil
                 await MainActor.run {
             isProcessing = false
                 analyzedFrames = liftedFrames
-            swingAnalysis = computedAnalysis
             if analyzedFrames.isEmpty {
                 analyzedFrames = [(image: UIImage(), joints: [:])]
             }
@@ -1183,244 +1428,6 @@ extension ContentView {
 
 // Removed elbow/knee refinement per user request
 
-// MARK: - Phase Jump Row and Metrics Summary
-struct PhaseJumpRow: View {
-    let analysis: SwingAnalysis
-    @Binding var currentFrameIndex: Int
-
-    var body: some View {
-        HStack(spacing: 12) {
-            PhaseJumpButton(label: "Address", frame: analysis.events.addressFrame, currentFrameIndex: $currentFrameIndex)
-            PhaseJumpButton(label: "Top", frame: analysis.events.topFrame, currentFrameIndex: $currentFrameIndex)
-            PhaseJumpButton(label: "Impact", frame: analysis.events.impactFrame, currentFrameIndex: $currentFrameIndex)
-            PhaseJumpButton(label: "Finish", frame: analysis.events.finishFrame, currentFrameIndex: $currentFrameIndex)
-        }
-        .padding(.top, 4)
-    }
-}
-
-struct PhaseJumpButton: View {
-    let label: String
-    let frame: Int
-    @Binding var currentFrameIndex: Int
-
-    var body: some View {
-        Button(action: {
-            withAnimation(.easeInOut(duration: 0.25)) {
-                currentFrameIndex = max(0, frame)
-            }
-        }) {
-            HStack(spacing: 6) {
-                Image(systemName: "flag.fill").font(.caption)
-                Text(label).font(.caption)
-            }
-            .padding(.vertical, 6)
-            .padding(.horizontal, 10)
-            .background(RoundedRectangle(cornerRadius: 8).fill(Color.white.opacity(0.9)))
-            .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color(red: 0.76, green: 0.60, blue: 0.42)))
-        }
-        .buttonStyle(.plain)
-    }
-}
-
-struct MetricsSummaryView: View {
-    let analysis: SwingAnalysis
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("Swing Scorecard").font(.headline).foregroundColor(Color(red: 0.42, green: 0.30, blue: 0.25))
-            HStack {
-                MetricPill(title: "Tempo", value: String(format: "%.1f:1", analysis.metrics.tempoRatio))
-                MetricPill(title: "Backswing", value: String(format: "%.2fs", analysis.metrics.backswingSeconds))
-                MetricPill(title: "Downswing", value: String(format: "%.2fs", analysis.metrics.downswingSeconds))
-            }
-            HStack {
-                MetricPill(title: "Shoulder Tilt (Addr)", value: String(format: "%.0f°", analysis.metrics.shoulderTiltAddress))
-                MetricPill(title: "Shoulder Tilt (Imp)", value: String(format: "%.0f°", analysis.metrics.shoulderTiltImpact))
-                MetricPill(title: "X-Factor (Top)", value: String(format: "%.0f°", analysis.metrics.xFactorTop))
-            }
-            HStack {
-                MetricPill(title: "Pelvis Sway (Top)", value: String(format: "%.0f px", analysis.metrics.pelvisSwayTopPx))
-                MetricPill(title: "Head Move", value: String(format: "%.0f px", analysis.metrics.headDisplacementPx))
-            }
-        }
-        .padding(12)
-        .background(RoundedRectangle(cornerRadius: 12).fill(Color.white.opacity(0.9)))
-        .shadow(color: Color.black.opacity(0.05), radius: 6, x: 0, y: 2)
-    }
-}
-
-struct MetricPill: View {
-    let title: String
-    let value: String
-    
-    var body: some View {
-        VStack(spacing: 2) {
-            Text(title).font(.caption2).foregroundColor(Color(red: 0.42, green: 0.30, blue: 0.25))
-            Text(value).font(.footnote).fontWeight(.semibold).foregroundColor(Color(red: 0.76, green: 0.60, blue: 0.42))
-        }
-        .padding(.vertical, 6)
-        .padding(.horizontal, 8)
-        .background(RoundedRectangle(cornerRadius: 8).fill(Color.white))
-        .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color(red: 0.95, green: 0.92, blue: 0.88)))
-    }
-}
-
-// MARK: - Swing Phases and Metrics (summary)
-struct SwingEvents {
-    let addressFrame: Int
-    let startFrame: Int
-    let topFrame: Int
-    let impactFrame: Int
-    let finishFrame: Int
-}
-
-struct SwingMetrics {
-    let tempoRatio: Double
-    let backswingSeconds: Double
-    let downswingSeconds: Double
-    let shoulderTiltAddress: Double
-    let shoulderTiltImpact: Double
-    let xFactorTop: Double
-    let pelvisSwayTopPx: Double
-    let headDisplacementPx: Double
-}
-
-struct SwingAnalysis {
-    let events: SwingEvents
-    let metrics: SwingMetrics
-}
-
-extension ContentView {
-    // Analyze hand-center motion to segment swing and compute core metrics
-    func analyzeSwing(frames: [(image: UIImage, joints: [Int: CGPoint])], fps: CGFloat) -> SwingAnalysis? {
-        guard frames.count > 8, fps > 0 else { return nil }
-
-        let dt = 1.0 / Double(fps)
-        let wristLeft = 15
-        let wristRight = 16
-        let shoulderLeft = 11
-        let shoulderRight = 12
-        let hipLeft = 23
-        let hipRight = 24
-        let nose = 0
-
-        // Build time series
-        var hand: [CGPoint] = []
-        hand.reserveCapacity(frames.count)
-        for f in frames {
-            let j = f.joints
-            let wl = j[wristLeft] ?? .zero
-            let wr = j[wristRight] ?? .zero
-            let hcHand = CGPoint(x: (wl.x + wr.x) * 0.5, y: (wl.y + wr.y) * 0.5)
-            hand.append(hcHand)
-        }
-
-        // Speed of hands
-        var speed: [Double] = Array(repeating: 0, count: hand.count)
-        for i in 1..<hand.count {
-            speed[i] = Double(hypot(hand[i].x - hand[i-1].x, hand[i].y - hand[i-1].y)) / dt
-        }
-        // Smooth speed (simple moving average)
-        speed = movingAverage(speed, window: 3)
-
-        // Thresholds relative to early baseline
-        let baselineCount = max(5, min(20, speed.count / 10))
-        let base = speed.prefix(baselineCount).reduce(0, +) / Double(baselineCount)
-        let startThresh = max(base * 3.0, 20.0)
-        let quietThresh = max(base * 1.5, 10.0)
-
-        // Detect start of takeaway
-        var startIdx = 0
-        for i in baselineCount..<speed.count {
-            if speed[i] > startThresh { startIdx = i; break }
-        }
-
-        // Find top as speed valley after start before global post-start max
-        let postStart = Array(speed.suffix(from: max(startIdx, 1)))
-        guard let maxAfterStart = postStart.max(), let maxIdxLocal = postStart.firstIndex(of: maxAfterStart) else {
-            return nil
-        }
-        let maxIdx = max(startIdx, 1) + maxIdxLocal
-        var topIdx = startIdx
-        if maxIdx - startIdx > 4 {
-            var minVal = Double.greatestFiniteMagnitude
-            var minIdx = startIdx
-            for i in startIdx..<(maxIdx) {
-                if speed[i] < minVal { minVal = speed[i]; minIdx = i }
-            }
-            topIdx = minIdx
-        }
-
-        // Impact ~ global max speed after top
-        let postTop = Array(speed.suffix(from: min(topIdx + 1, speed.count - 1)))
-        guard let impactMax = postTop.max(), let impactLocal = postTop.firstIndex(of: impactMax) else {
-            return nil
-        }
-        let impactIdx = min(topIdx + 1, speed.count - 1) + impactLocal
-
-        // Finish when speed falls below quiet threshold and stays low
-        var finishIdx = impactIdx
-        for i in impactIdx..<speed.count {
-            if speed[i] < quietThresh { finishIdx = i; break }
-        }
-
-        // Times and tempo
-        let backswingTime = max(0, Double(topIdx - startIdx)) * dt
-        let downswingTime = max(0, Double(impactIdx - topIdx)) * dt
-        let tempo = downswingTime > 0 ? backswingTime / downswingTime : 0
-
-        // Angles/metrics
-        func lineAngleDeg(_ a: CGPoint, _ b: CGPoint) -> Double {
-            let ang = atan2(Double(b.y - a.y), Double(b.x - a.x))
-            return ang * 180.0 / .pi
-        }
-        let shouldersAddr = lineAngleDeg(frames[0].joints[12] ?? .zero, frames[0].joints[11] ?? .zero)
-        let shouldersImp = lineAngleDeg(frames[impactIdx].joints[12] ?? .zero, frames[impactIdx].joints[11] ?? .zero)
-        let hipsTop = lineAngleDeg(frames[topIdx].joints[24] ?? .zero, frames[topIdx].joints[23] ?? .zero)
-        let shouldersTop = lineAngleDeg(frames[topIdx].joints[12] ?? .zero, frames[topIdx].joints[11] ?? .zero)
-        let xFactor = abs(shouldersTop - hipsTop)
-
-        let pelvisAddr = midPoint(frames[0].joints[23] ?? .zero, frames[0].joints[24] ?? .zero)
-        let pelvisTop = midPoint(frames[topIdx].joints[23] ?? .zero, frames[topIdx].joints[24] ?? .zero)
-        let pelvisSwayTop = Double(pelvisTop.x - pelvisAddr.x)
-
-        let headAddr = frames[0].joints[0] ?? .zero
-        let headFin = frames[min(finishIdx, frames.count - 1)].joints[0] ?? .zero
-        let headMove = Double(hypot(headFin.x - headAddr.x, headFin.y - headAddr.y))
-
-        let events = SwingEvents(addressFrame: 0, startFrame: startIdx, topFrame: topIdx, impactFrame: impactIdx, finishFrame: finishIdx)
-        let metrics = SwingMetrics(
-            tempoRatio: tempo,
-            backswingSeconds: backswingTime,
-            downswingSeconds: downswingTime,
-            shoulderTiltAddress: shouldersAddr,
-            shoulderTiltImpact: shouldersImp,
-            xFactorTop: xFactor,
-            pelvisSwayTopPx: pelvisSwayTop,
-            headDisplacementPx: headMove
-        )
-        return SwingAnalysis(events: events, metrics: metrics)
-    }
-
-    private func movingAverage(_ values: [Double], window: Int) -> [Double] {
-        guard window > 1, values.count > window else { return values }
-        var result = values
-        var sum = values.prefix(window).reduce(0, +)
-        result[window/2] = sum / Double(window)
-        for i in window..<values.count {
-            sum += values[i] - values[i - window]
-            let center = i - window/2
-            if center < result.count {
-                result[center] = sum / Double(window)
-            }
-        }
-        return result
-    }
-
-    private func midPoint(_ a: CGPoint, _ b: CGPoint) -> CGPoint {
-        CGPoint(x: (a.x + b.x) * 0.5, y: (a.y + b.y) * 0.5)
-    }
-}
+// Phase analysis types and helpers removed
 
 // (Removed duplicate Color.init(hex:) to avoid redeclaration)

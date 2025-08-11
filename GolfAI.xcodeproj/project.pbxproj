@@ -52,22 +52,16 @@
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		3BEFCF442E36BF02006FC5A6 /* GolfAI */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
-			exceptions = (
-			);
 			path = GolfAI;
 			sourceTree = "<group>";
 		};
 		3BEFCF532E36BF03006FC5A6 /* GolfAITests */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
-			exceptions = (
-			);
 			path = GolfAITests;
 			sourceTree = "<group>";
 		};
 		3BEFCF5D2E36BF04006FC5A6 /* GolfAIUITests */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
-			exceptions = (
-			);
 			path = GolfAIUITests;
 			sourceTree = "<group>";
 		};

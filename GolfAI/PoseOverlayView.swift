@@ -1,4 +1,5 @@
 import SwiftUI
+import CoreGraphics
 
 struct PoseOverlayView: View {
     let frames: [(image: UIImage, joints: [Int: CGPoint])]
@@ -117,6 +118,8 @@ struct PoseOverlayView: View {
                         context.fill(Path(ellipseIn: CGRect(x: point.x - 3, y: point.y - 3, width: 6, height: 6)), with: .color(Color.white)) // White dots
                     }
                 }
+
+                // Club overlays removed
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
