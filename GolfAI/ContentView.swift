@@ -594,6 +594,7 @@ struct CoachView: View { var body: some View { VStack{ Text("Coach").font(.title
 struct ContentView: View {
     @State private var selectedVideoURL: URL?
     @State private var analyzedFrames: [(image: UIImage, joints: [Int: CGPoint])] = []
+    @State private var smoothedFrames: [(image: UIImage, joints: [Int: CGPoint])] = []
     private let poseWrapper = BlazePoseWrapper()
     private let handWrapper = HandLandmarkerWrapper()
     // Off-device lifter client
@@ -621,6 +622,7 @@ struct ContentView: View {
     // Performance tuning
     private let analysisFPS: Double = 60.0
     private let ciContextShared = CIContext()
+    @State private var showSmoothedPreview: Bool = true
     // Enforce portrait-only usage for capture/analysis UI
     init() {
         UIDevice.current.beginGeneratingDeviceOrientationNotifications()
@@ -732,8 +734,10 @@ struct ContentView: View {
                                         estimatedTimeRemaining: estimatedTimeRemaining
                                     )
                                 } else if !analyzedFrames.isEmpty {
+                                    Toggle("Smooth preview", isOn: $showSmoothedPreview)
+                                        .tint(.turf)
                                     AnalysisCompleteView(
-                                        analyzedFrames: analyzedFrames,
+                                        analyzedFrames: showSmoothedPreview && !smoothedFrames.isEmpty ? smoothedFrames : analyzedFrames,
                                         currentFrameIndex: $currentFrameIndex,
                                         lifterStatusText: nil,
                                         phaseDone: [
@@ -764,6 +768,7 @@ struct ContentView: View {
                                             videoDuration = 0
                                             estimatedTimeRemaining = 0
                                             currentFrameIndex = 0
+                                            smoothedFrames = []
                                             showVideoPicker = true
                                         }
                                     )
@@ -1024,7 +1029,7 @@ struct AnalysisCompleteView: View {
             // Frame Display with Navigation
             VStack(spacing: 12) {
                 if !analyzedFrames.isEmpty {
-                    PoseOverlayView(frames: [analyzedFrames[currentFrameIndex]])
+                    PoseOverlayView(frames: [ analyzedFrames[currentFrameIndex] ])
                         .frame(height: 700)
                         .clipShape(RoundedRectangle(cornerRadius: 12))
                         .shadow(color: Color.black.opacity(0.1), radius: 8, x: 0, y: 4)
@@ -1407,10 +1412,15 @@ extension ContentView {
         }
         // BlazePose-only: pass through detections
         detectedFrames = analyzedFrames
-        let liftedFrames = analyzedFrames
+        // Apply zero-lag wrist ID guard to avoid L/R swaps
+        let idGuarded = enforceArmIdentity(frames: analyzedFrames)
+        // Prepare offline smoothing for preview
+        let smoothed = smoothWristsSavGol(frames: idGuarded, fps: analysisFPS, window: 13, poly: 2)
+        let liftedFrames = idGuarded
                 await MainActor.run {
             isProcessing = false
                 analyzedFrames = liftedFrames
+                smoothedFrames = smoothed
             if analyzedFrames.isEmpty {
                 analyzedFrames = [(image: UIImage(), joints: [:])]
             }
@@ -1418,8 +1428,96 @@ extension ContentView {
     }
 }
 
-// MARK: - Minimal, low-lag stabilization
+// MARK: - Minimal, low-lag stabilization and offline smoothing
 extension ContentView {
+    // Offline Savitzky–Golay smoothing for wrist landmarks only
+    func smoothWristsSavGol(frames: [(image: UIImage, joints: [Int: CGPoint])], fps: Double, window: Int = 13, poly: Int = 2) -> [(image: UIImage, joints: [Int: CGPoint])] {
+        guard !frames.isEmpty, window % 2 == 1, window >= 5 else { return frames }
+        let L = 15, R = 16
+        var xL: [Double] = [], yL: [Double] = [], xR: [Double] = [], yR: [Double] = []
+        for f in frames {
+            xL.append(Double(f.joints[L]?.x ?? .nan))
+            yL.append(Double(f.joints[L]?.y ?? .nan))
+            xR.append(Double(f.joints[R]?.x ?? .nan))
+            yR.append(Double(f.joints[R]?.y ?? .nan))
+        }
+        func fill(_ v: inout [Double]) {
+            var last = v.first(where: { !$0.isNaN }) ?? 0
+            for i in 0..<v.count { if v[i].isNaN { v[i] = last } else { last = v[i] } }
+            var next = v.last(where: { !$0.isNaN }) ?? last
+            for i in stride(from: v.count-1, through: 0, by: -1) { if v[i].isNaN { v[i] = next } else { next = v[i] } }
+        }
+        fill(&xL); fill(&yL); fill(&xR); fill(&yR)
+        let coeffs = savgolCoefficients(window: window, poly: poly)
+        func conv(_ s: [Double]) -> [Double] { convolveCentered(s, coeffs) }
+        let sxL = conv(xL), syL = conv(yL), sxR = conv(xR), syR = conv(yR)
+        var out = frames
+        for i in 0..<out.count {
+            var j = out[i].joints
+            if j[L] != nil { j[L] = CGPoint(x: CGFloat(sxL[i]), y: CGFloat(syL[i])) }
+            if j[R] != nil { j[R] = CGPoint(x: CGFloat(sxR[i]), y: CGFloat(syR[i])) }
+            out[i] = (image: out[i].image, joints: j)
+        }
+        return out
+    }
+
+    private func convolveCentered(_ signal: [Double], _ kernel: [Double]) -> [Double] {
+        let k = kernel.count
+        let r = k / 2
+        var padded: [Double] = Array(repeating: signal.first ?? 0, count: r)
+        padded.append(contentsOf: signal)
+        padded.append(contentsOf: Array(repeating: signal.last ?? 0, count: r))
+        var out = Array(repeating: 0.0, count: signal.count)
+        for i in 0..<signal.count {
+            var s = 0.0
+            for j in 0..<k { s += padded[i + j] * kernel[j] }
+            out[i] = s
+        }
+        return out
+    }
+
+    private func savgolCoefficients(window: Int, poly: Int) -> [Double] {
+        let m = window
+        let p = poly
+        let half = m / 2
+        // Build A (m x (p+1)) with rows [1, x, x^2, ...] for x = -half..half
+        var A = Array(repeating: Array(repeating: 0.0, count: p+1), count: m)
+        for i in 0..<m {
+            let x = Double(i - half)
+            var v = 1.0
+            for j in 0...p { A[i][j] = v; v *= x }
+        }
+        // Compute G = (A^T A)^{-1} A^T
+        var AT_A = Array(repeating: Array(repeating: 0.0, count: p+1), count: p+1)
+        for i in 0...p { for j in 0...p { var s = 0.0; for r in 0..<m { s += A[r][i] * A[r][j] }; AT_A[i][j] = s } }
+        let inv = invertMatrix(AT_A)
+        var AT = Array(repeating: Array(repeating: 0.0, count: m), count: p+1)
+        for i in 0...p { for j in 0..<m { AT[i][j] = A[j][i] } }
+        var G = Array(repeating: Array(repeating: 0.0, count: m), count: p+1)
+        for i in 0...p { for j in 0..<m { var s = 0.0; for k in 0...p { s += inv[i][k] * AT[k][j] }; G[i][j] = s } }
+        // Coeffs for smoothing at center correspond to the first row (monomial 0) of G: c[j] = G[0][j]
+        return G[0]
+    }
+    private func invertMatrix(_ M: [[Double]]) -> [[Double]] {
+        let n = M.count
+        var A = M
+        var I = (0..<n).map { i in (0..<n).map { j in i==j ? 1.0 : 0.0 } }
+        for i in 0..<n {
+            var piv = A[i][i]
+            var r = i
+            if abs(piv) < 1e-9 {
+                for k in i+1..<n { if abs(A[k][i]) > abs(piv) { piv = A[k][i]; r = k } }
+                if r != i { A.swapAt(i, r); I.swapAt(i, r) }
+            }
+            let invP = 1.0 / (A[i][i])
+            for j in 0..<n { A[i][j] *= invP; I[i][j] *= invP }
+            for k in 0..<n where k != i {
+                let f = A[k][i]
+                for j in 0..<n { A[k][j] -= f * A[i][j]; I[k][j] -= f * I[i][j] }
+            }
+        }
+        return I
+    }
     // Keep wrists consistent across frames to avoid L/R swaps
     func enforceArmIdentity(frames: [(image: UIImage, joints: [Int: CGPoint])]) -> [(image: UIImage, joints: [Int: CGPoint])] {
         guard frames.count > 1 else { return frames }
