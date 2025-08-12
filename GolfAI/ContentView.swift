@@ -1,4 +1,5 @@
 import SwiftUI
+import AVKit
 import AVFoundation
 import MediaPipeTasksVision
 
@@ -18,6 +19,175 @@ struct RootTabView: View {
                 .tabItem { Label("Coach", systemImage: "message.circle.fill") }
         }
         .accentColor(.turf)
+    }
+}
+
+// MARK: - Forearm length clamp (prevents inward collapse)
+extension ContentView {
+    // Limit per-frame elbow->wrist direction change to avoid sudden flips
+    func guardWristAngleChange(frames: [(image: UIImage, joints: [Int: CGPoint])], maxAngleDeg: CGFloat = 55) -> [(image: UIImage, joints: [Int: CGPoint])] {
+        guard frames.count > 1 else { return frames }
+        var result = frames
+        let LW = 15, RW = 16, LE = 13, RE = 14
+        let cosThresh = cos(maxAngleDeg * .pi / 180)
+        for i in 1..<result.count {
+            var j = result[i].joints
+            let jp = result[i-1].joints
+            func clampOne(wIdx: Int, eIdx: Int) {
+                guard let e = j[eIdx], var w = j[wIdx], let ep = jp[eIdx], let wp = jp[wIdx] else { return }
+                let vPrev = CGPoint(x: wp.x - ep.x, y: wp.y - ep.y)
+                let vCurr = CGPoint(x: w.x - e.x, y: w.y - e.y)
+                let lp = max(1e-3, hypot(vPrev.x, vPrev.y))
+                let lc = max(1e-3, hypot(vCurr.x, vCurr.y))
+                let up = CGPoint(x: vPrev.x / lp, y: vPrev.y / lp)
+                let uc = CGPoint(x: vCurr.x / lc, y: vCurr.y / lc)
+                let cosang = up.x * uc.x + up.y * uc.y
+                if cosang < cosThresh {
+                    // Too large a turn: keep previous direction, preserve current length
+                    let target = CGPoint(x: e.x + up.x * lc, y: e.y + up.y * lc)
+                    w = target
+                    j[wIdx] = w
+                }
+            }
+            clampOne(wIdx: LW, eIdx: LE)
+            clampOne(wIdx: RW, eIdx: RE)
+            result[i] = (image: result[i].image, joints: j)
+        }
+        return result
+    }
+    // Predictive outlier guard for wrists: rejects sudden jumps vs constant-velocity prediction
+    func guardWristOutliers(frames: [(image: UIImage, joints: [Int: CGPoint])], fps: CGFloat) -> [(image: UIImage, joints: [Int: CGPoint])] {
+        guard frames.count > 2, fps > 0 else { return frames }
+        var result = frames
+        let LW = 15, RW = 16
+        let dt: CGFloat = 1.0 / fps
+        let maxJump: CGFloat = 24 // if jump exceeds this vs prediction, clamp to prediction
+        for i in 2..<result.count {
+            var j = result[i].joints
+            let j1 = result[i-1].joints
+            let j2 = result[i-2].joints
+            func guardOne(_ idx: Int) {
+                guard let p1 = j1[idx], let p2 = j2[idx], let cur = j[idx] else { return }
+                let vx = (p1.x - p2.x) / dt
+                let vy = (p1.y - p2.y) / dt
+                let pred = CGPoint(x: p1.x + vx * dt, y: p1.y + vy * dt)
+                let d = hypot(cur.x - pred.x, cur.y - pred.y)
+                if d > maxJump {
+                    // clamp toward prediction, keep at most maxJump away
+                    let ux = (cur.x - pred.x) / d
+                    let uy = (cur.y - pred.y) / d
+                    j[idx] = CGPoint(x: pred.x + ux * maxJump, y: pred.y + uy * maxJump)
+                }
+            }
+            guardOne(LW)
+            guardOne(RW)
+            result[i] = (image: result[i].image, joints: j)
+        }
+        return result
+    }
+    // Hand Assist: use hand landmarker in tiny ROI near each wrist with strict acceptance rules
+    func handAssistWrists(frames: [(image: UIImage, joints: [Int: CGPoint])], fps: CGFloat) async -> [(image: UIImage, joints: [Int: CGPoint])] {
+        guard fps > 0, !frames.isEmpty else { return frames }
+        // Ensure model is ready
+        _ = await handWrapper.prepareIfNeeded()
+        var result = frames
+        let LW = 15, RW = 16, LE = 13, RE = 14
+        let roiRadius: CGFloat = 72
+        let acceptRadius: CGFloat = 38
+        let speedBypass: CGFloat = 70
+        for i in 1..<result.count {
+            var j = result[i].joints
+            let prev = result[i-1].joints
+            func assist(wIdx: Int, eIdx: Int) {
+                guard let w = j[wIdx], let e = j[eIdx] else { return }
+                // Speed gate
+                if let pw = prev[wIdx] {
+                    let sp = hypot(w.x - pw.x, w.y - pw.y) * fps
+                    if sp > speedBypass { return }
+                }
+                let roi = CGRect(x: w.x - roiRadius, y: w.y - roiRadius, width: roiRadius*2, height: roiRadius*2)
+                let hands = handWrapper.detectHandLandmarks(in: result[i].image, roi: roi)
+                guard !hands.isEmpty else { return }
+                // Choose anchor = mean of wrist+MCPs
+                let pick = [0,5,9,13,17]
+                var best: CGPoint? = nil
+                var bestScore: CGFloat = .greatestFiniteMagnitude
+                let vW = CGPoint(x: w.x - e.x, y: w.y - e.y)
+                let vWLen = max(1e-3, hypot(vW.x, vW.y))
+                for hd in hands {
+                    guard hd.landmarks.count > 17 else { continue }
+                    var sx: CGFloat = 0, sy: CGFloat = 0
+                    for idx in pick { let p = hd.landmarks[idx]; sx += p.x; sy += p.y }
+                    let c = CGFloat(pick.count)
+                    let a = CGPoint(x: sx/c, y: sy/c)
+                    let d = hypot(a.x - w.x, a.y - w.y)
+                    if d >= acceptRadius { continue }
+                    let vA = CGPoint(x: a.x - e.x, y: a.y - e.y)
+                    let vALen = max(1e-3, hypot(vA.x, vA.y))
+                    let cos = (vW.x * vA.x + vW.y * vA.y) / (vWLen * vALen)
+                    if cos < 0.6 { continue }
+                    if d < bestScore { bestScore = d; best = a }
+                }
+                guard let anchor = best else { return }
+                // Small blend toward anchor
+                let maxDelta: CGFloat = 6
+                var target = CGPoint(x: w.x + max(-maxDelta, min(maxDelta, anchor.x - w.x)),
+                                      y: w.y + max(-maxDelta, min(maxDelta, anchor.y - w.y)))
+                // Clamp forearm length softly to current length to avoid inward pull; final hard clamp happens later
+                let vx = target.x - e.x, vy = target.y - e.y
+                let len = max(1e-3, hypot(vx, vy))
+                let ux = vx / len, uy = vy / len
+                let keepLen = vWLen
+                target = CGPoint(x: e.x + ux * keepLen, y: e.y + uy * keepLen)
+                j[wIdx] = target
+            }
+            assist(wIdx: LW, eIdx: LE)
+            assist(wIdx: RW, eIdx: RE)
+            result[i] = (image: result[i].image, joints: j)
+        }
+        return result
+    }
+    func clampForearmLengths(frames: [(image: UIImage, joints: [Int: CGPoint])]) -> [(image: UIImage, joints: [Int: CGPoint])] {
+        guard !frames.isEmpty else { return frames }
+        var result = frames
+        let LE = 13, RE = 14, LW = 15, RW = 16
+        func median(_ v: [CGFloat]) -> CGFloat {
+            let s = v.sorted(); let m = s.count/2
+            return s.isEmpty ? 0 : (s.count % 2 == 0 ? (s[m-1]+s[m]) * 0.5 : s[m])
+        }
+        var lLens: [CGFloat] = [], rLens: [CGFloat] = []
+        for f in result {
+            if let e = f.joints[LE], let w = f.joints[LW] { lLens.append(hypot(w.x - e.x, w.y - e.y)) }
+            if let e = f.joints[RE], let w = f.joints[RW] { rLens.append(hypot(w.x - e.x, w.y - e.y)) }
+        }
+        let lMed = max(1, median(lLens)), rMed = max(1, median(rLens))
+        // Tighter clamp to prevent forearm collapse/over-extension
+        let minScale: CGFloat = 0.97, maxScale: CGFloat = 1.05
+        for i in 0..<result.count {
+            var j = result[i].joints
+            if let e = j[LE], var w = j[LW] {
+                let vx = w.x - e.x, vy = w.y - e.y
+                let len = max(1e-3, hypot(vx, vy))
+                if len < minScale*lMed || len > maxScale*lMed {
+                    let ux = vx/len, uy = vy/len
+                    let target = min(max(len, minScale*lMed), maxScale*lMed)
+                    w = CGPoint(x: e.x + ux*target, y: e.y + uy*target)
+                    j[LW] = w
+                }
+            }
+            if let e = j[RE], var w = j[RW] {
+                let vx = w.x - e.x, vy = w.y - e.y
+                let len = max(1e-3, hypot(vx, vy))
+                if len < minScale*rMed || len > maxScale*rMed {
+                    let ux = vx/len, uy = vy/len
+                    let target = min(max(len, minScale*rMed), maxScale*rMed)
+                    w = CGPoint(x: e.x + ux*target, y: e.y + uy*target)
+                    j[RW] = w
+                }
+            }
+            result[i] = (image: result[i].image, joints: j)
+        }
+        return result
     }
 }
 
@@ -216,6 +386,195 @@ struct WorkOnList: View {
         }
     }
 }
+
+// MARK: - Trim UI (portrait)
+import AVKit
+struct TrimView: View {
+    let url: URL
+    let onCancel: () -> Void
+    let onUse: (CMTimeRange?) -> Void
+
+    @State private var player: AVPlayer = AVPlayer()
+    @State private var duration: Double = 0
+    @State private var start: Double = 0
+    @State private var end: Double = 0
+    @State private var isPlaying: Bool = true
+
+    var body: some View {
+        GeometryReader { geo in
+            VStack(spacing: 0) {
+                // Video fills most of the screen
+                ZStack(alignment: .bottom) {
+                    VideoPlayer(player: player)
+                        .frame(width: geo.size.width, height: geo.size.height * 0.74)
+                        .clipped()
+
+                    // Speech-bubble hint
+                    Text("Select swing portion of the video")
+                        .font(.subheadline)
+                        .foregroundColor(.black)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 8)
+                        .background(
+                            RoundedRectangle(cornerRadius: 16)
+                                .fill(Color.white)
+                                .shadow(color: .black.opacity(0.15), radius: 6, y: 3)
+                        )
+                        .padding(.bottom, 8)
+                }
+
+                // Bottom control panel pinned
+                VStack(spacing: 14) {
+                    // Filmstrip centered
+                    ZStack(alignment: .leading) {
+                        RoundedRectangle(cornerRadius: 12)
+                            .fill(Color.black.opacity(0.85))
+                            .frame(height: 56)
+
+                        // Yellow filmstrip track
+                        HStack(spacing: 8) {
+                            Button(action: { nudgeStart(-0.05) }) {
+                                Image(systemName: "chevron.left").font(.headline).foregroundColor(.black)
+                            }
+                            ZStack {
+                                RoundedRectangle(cornerRadius: 8)
+                                    .fill(Color.yellow)
+                                RangeSlider(minValue: 0, maxValue: max(0.1, duration), lowerValue: $start, upperValue: $end)
+                                    .padding(.horizontal, 12)
+                            }
+                            Button(action: { nudgeEnd(0.05) }) {
+                                Image(systemName: "chevron.right").font(.headline).foregroundColor(.black)
+                            }
+                        }
+                        .padding(.horizontal, 12)
+                        .frame(height: 40)
+                        .padding(.horizontal, 10)
+                    }
+                    .frame(maxWidth: min(geo.size.width * 0.9, 560))
+                    .frame(maxWidth: .infinity)
+
+                    // Centered play/pause
+                    HStack { Button(action: togglePlay) {
+                        Image(systemName: isPlaying ? "pause.fill" : "play.fill")
+                            .foregroundColor(.white)
+                            .padding(12)
+                            .background(RoundedRectangle(cornerRadius: 10).fill(Color.black.opacity(0.8)))
+                    } }
+
+                    // Centered actions
+                    HStack(spacing: 16) {
+                        Button("Change") { onCancel() }
+                            .foregroundColor(.white)
+                        Button(action: { onUse(makeRange()) }) {
+                            HStack(spacing: 6) {
+                                Text("Continue").fontWeight(.semibold)
+                                Text(">>>")
+                            }
+                            .padding(.vertical, 10)
+                            .padding(.horizontal, 16)
+                            .background(RoundedRectangle(cornerRadius: 14).fill(Color.cyan))
+                            .foregroundColor(.black)
+                        }
+                    }
+                    .padding(.bottom, 12)
+                }
+                .frame(width: geo.size.width)
+                .background(Color.black.opacity(0.95))
+            }
+            .padding(.top, 8)
+            .ignoresSafeArea()
+            .background(Color.black.ignoresSafeArea())
+        }
+        .onAppear {
+            let asset = AVURLAsset(url: url)
+            Task {
+                do {
+                    let d = try await asset.load(.duration)
+                    let secs = CMTimeGetSeconds(d)
+                    duration = secs
+                    if end == 0 { end = secs }
+                    player.replaceCurrentItem(with: AVPlayerItem(asset: asset))
+                    player.play()
+                    isPlaying = true
+                } catch { }
+            }
+        }
+        .onChange(of: start) { newVal in
+            // Scrub preview to new start while dragging
+            player.pause(); isPlaying = false
+            seek(to: newVal)
+        }
+        .onChange(of: end) { newVal in
+            // Scrub preview to new end while dragging
+            player.pause(); isPlaying = false
+            seek(to: newVal)
+        }
+    }
+
+    private func makeRange() -> CMTimeRange? {
+        guard duration > 0, end > start else { return nil }
+        let startTime = CMTime(seconds: start, preferredTimescale: 600)
+        let endTime = CMTime(seconds: end, preferredTimescale: 600)
+        return CMTimeRange(start: startTime, end: endTime)
+    }
+
+    private func format(_ s: Double) -> String {
+        let m = Int(s) / 60
+        let r = Int(s) % 60
+        return String(format: "%d:%02d", m, r)
+    }
+
+    private func togglePlay() {
+        if isPlaying { player.pause() } else { player.play() }
+        isPlaying.toggle()
+    }
+    private func nudgeStart(_ delta: Double) {
+        start = max(0, min(start + delta, end))
+        seek(to: start)
+    }
+    private func nudgeEnd(_ delta: Double) {
+        end = min(duration, max(end + delta, start))
+        seek(to: end)
+    }
+    private func seek(to seconds: Double) {
+        let t = CMTime(seconds: seconds, preferredTimescale: 600)
+        player.seek(to: t, toleranceBefore: .zero, toleranceAfter: .zero)
+    }
+}
+
+struct RangeSlider: View {
+    let minValue: Double
+    let maxValue: Double
+    @Binding var lowerValue: Double
+    @Binding var upperValue: Double
+
+    var body: some View {
+        GeometryReader { geo in
+            ZStack(alignment: .leading) {
+                Capsule().fill(Color.ink.opacity(0.6)).frame(height: 6)
+                let width = geo.size.width
+                let span = max(0.0001, maxValue - minValue)
+                let lX = CGFloat((lowerValue - minValue) / span) * width
+                let uX = CGFloat((upperValue - minValue) / span) * width
+                Capsule().fill(Color.gold).frame(width: max(uX - lX, 6), height: 6).offset(x: lX)
+                Circle().fill(Color.white).overlay(Circle().stroke(Color.gold, lineWidth: 2))
+                    .frame(width: 24, height: 24)
+                    .position(x: max(12, min(width - 12, lX)), y: 12)
+                    .gesture(DragGesture().onChanged { g in
+                        let t = max(0, min(1, (g.location.x / width)))
+                        lowerValue = min(upperValue, minValue + Double(t) * span)
+                    })
+                Circle().fill(Color.white).overlay(Circle().stroke(Color.gold, lineWidth: 2))
+                    .frame(width: 24, height: 24)
+                    .position(x: max(12, min(width - 12, uX)), y: 12)
+                    .gesture(DragGesture().onChanged { g in
+                        let t = max(0, min(1, (g.location.x / width)))
+                        upperValue = max(lowerValue, minValue + Double(t) * span)
+                    })
+            }
+        }
+    }
+}
 struct BestFramesGrid: View {
     var body: some View {
         LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible()), GridItem(.flexible())], spacing: 8) {
@@ -240,6 +599,8 @@ struct ContentView: View {
     // Off-device lifter client
     private let lifterService = LifterService()
     @State private var showVideoPicker = false
+    @State private var showTrimUI = false
+    @State private var trimmedTimeRange: CMTimeRange? = nil
     @State private var isProcessing = false
     @State private var isLoading = true
     @State private var processingProgress: Double = 0.0
@@ -258,8 +619,15 @@ struct ContentView: View {
     private let ballDetector = BallDetector()
     @State private var clubTracker = MultiPointKalman(dt: 1.0/20.0)
     // Performance tuning
-    private let analysisFPS: Double = 12.0
+    private let analysisFPS: Double = 60.0
     private let ciContextShared = CIContext()
+    // Enforce portrait-only usage for capture/analysis UI
+    init() {
+        UIDevice.current.beginGeneratingDeviceOrientationNotifications()
+        if UIDevice.current.orientation.isLandscape {
+            // Simple visual hint can be added via UI; logic-wise we continue but design targets portrait
+        }
+    }
     // Phase labeling for dataset export
     enum PhaseName: String, CaseIterable { case address, takeaway, midBackswing, top, midDownswing, impact, followThrough, finish }
     struct PhaseLabels { var address: Int?; var takeaway: Int?; var midBackswing: Int?; var top: Int?; var midDownswing: Int?; var impact: Int?; var followThrough: Int?; var finish: Int? }
@@ -417,6 +785,20 @@ struct ContentView: View {
                         endPoint: .bottomTrailing
                     )
                 )
+                .fullScreenCover(isPresented: $showTrimUI) {
+                    if let url = selectedVideoURL {
+                        TrimView(url: url, onCancel: {
+                            showTrimUI = false
+                            Task { await processVideoFrames() }
+                        }, onUse: { range in
+                            trimmedTimeRange = range
+                            showTrimUI = false
+                            Task { await processVideoFrames() }
+                        })
+                        .statusBar(hidden: true)
+                        .ignoresSafeArea()
+                    }
+                }
             }
         }
         // Toggles removed
@@ -425,11 +807,10 @@ struct ContentView: View {
                 selectedVideoURL = url
                 let selectedURL = url
                     Task {
-                        // Prepare hand landmarker for enhanced path (always on)
-                        handModelReady = await handWrapper.prepareIfNeeded()
-                        // Temporal lifter removed
-                        // Set video info directly
-                let asset = AVURLAsset(url: selectedURL)
+                        // Using BlazePose Heavy only (no hand model / post-processing)
+                        // Present a simple trim UI first (portrait only)
+                        await MainActor.run { showTrimUI = true }
+                        let asset = AVURLAsset(url: selectedURL)
                         do {
                             let duration = try await asset.load(.duration)
                             let durationSeconds = CMTimeGetSeconds(duration)
@@ -439,11 +820,15 @@ struct ContentView: View {
                         } catch {
                             print("Error loading video info: \(error)")
                         }
-                        await processVideoFrames()
+                        // Wait until user trims; if no trim chosen we analyze full clip
+                        if showTrimUI == false {
+                            await processVideoFrames()
+                        }
                     }
                 }
             }
         }
+        // Trim sheet handled via overlay above
     }
 
 
@@ -896,29 +1281,11 @@ extension ContentView {
     func rebuildFromDetected() {
         guard !detectedFrames.isEmpty else { return }
         Task {
-            let raw = detectedFrames
-            // Enhanced (no temporal lifter): wrist gap fill → identity guard → hand landmarker fusion → club cue → low‑lag smoothing
-            let wristGapFilled = fillWristGaps(frames: raw, maxGap: 3)
-            let idFixed = enforceArmIdentity(frames: wristGapFilled)
-            handModelReady = await handWrapper.prepareIfNeeded()
-            let wristsRefined = refineWristsWithHandsKalmanKF(frames: idFixed, fps: CGFloat(analysisFPS))
-            let withCue = nudgeWristsWithClubCue(frames: wristsRefined, fps: 20)
-            let stabilized = stabilizeLowLag(frames: withCue, fps: 20)
-            let finalFrames = stabilized.isEmpty ? withCue : stabilized
-            // Count fused frames
-            var fused = 0
-            for i in 0..<min(idFixed.count, wristsRefined.count) {
-                let aL = idFixed[i].joints[15]; let bL = wristsRefined[i].joints[15]
-                let aR = idFixed[i].joints[16]; let bR = wristsRefined[i].joints[16]
-                let movedL = (aL != nil && bL != nil) ? (hypot(aL!.x - bL!.x, aL!.y - bL!.y) > 0.75) : false
-                let movedR = (aR != nil && bR != nil) ? (hypot(aR!.x - bR!.x, aR!.y - bR!.y) > 0.75) : false
-                if movedL || movedR { fused += 1 }
-            }
-            fusionCount = fused
-            let liftedFrames = finalFrames
+            // BlazePose-only: no post-processing
+            let finalFrames = detectedFrames
             await MainActor.run {
-                analyzedFrames = liftedFrames
-                currentFrameIndex = min(currentFrameIndex, max(liftedFrames.count - 1, 0))
+                analyzedFrames = finalFrames
+                currentFrameIndex = min(currentFrameIndex, max(finalFrames.count - 1, 0))
             }
         }
     }
@@ -932,6 +1299,7 @@ extension ContentView {
         currentFrameIndex = 0
         
         let asset = AVURLAsset(url: videoURL)
+        // If a trim range exists, set timeRange on the reader output
         let reader = try? AVAssetReader(asset: asset)
         
         guard let reader = reader else {
@@ -963,11 +1331,19 @@ extension ContentView {
             track: track,
             outputSettings: outputSettings
         )
+        if let range = trimmedTimeRange { output.alwaysCopiesSampleData = false; reader.timeRange = range }
         
                 reader.add(output)
                 reader.startReading()
 
-                let interval = CMTimeMakeWithSeconds(1.0/analysisFPS, preferredTimescale: 600)
+        // Prefer higher sampling for smoother tracking (aim for ~60 FPS)
+        let interval = CMTimeMakeWithSeconds(1.0/60.0, preferredTimescale: 600)
+        // If trimmed, set slider/frames to trimmed duration
+        if let range = trimmedTimeRange {
+            let dur = CMTimeGetSeconds(range.duration)
+            videoDuration = dur
+            totalFrames = Int(dur * analysisFPS)
+        }
         var currentTime = CMTime.zero
         let startTime = Date()
         var frameIndex = 0
@@ -997,6 +1373,15 @@ extension ContentView {
                     }
                     
                     processedFrames += 1
+                        await MainActor.run {
+                        // Push UI progress updates immediately
+                        let clamped = min(processedFrames, totalFrames)
+                        if totalFrames > 0 {
+                            processingProgress = min(1.0, max(0.0, Double(clamped) / Double(totalFrames)))
+                        } else {
+                            processingProgress = 0.0
+                        }
+                    }
                     frameIndex += 1
                     // Clamp to avoid off-by-one display and out-of-bounds progress
                     if processedFrames > totalFrames { processedFrames = totalFrames }
@@ -1014,33 +1399,15 @@ extension ContentView {
                         estimatedTimeRemaining = Double(remainingFrames) * timePerFrame
                     }
                     
-                    if frameIndex % 24 == 0 { await Task.yield() }
+                    if frameIndex % 6 == 0 { await Task.yield() }
                 }
                 
                 currentTime = CMTimeAdd(currentTime, interval)
             }
         }
-        // Cache raw detections so toggles can rebuild instantly without re-reading video
+        // BlazePose-only: pass through detections
         detectedFrames = analyzedFrames
-        // Enhanced (no temporal lifter): wrist gap fill → identity guard → hand landmarker fusion → club cue → low‑lag smoothing
-        let raw = analyzedFrames
-        let wristGapFilled = fillWristGaps(frames: raw, maxGap: 3)
-        let idFixed = enforceArmIdentity(frames: wristGapFilled)
-        handModelReady = await handWrapper.prepareIfNeeded()
-        let wristsRefined = refineWristsWithHandsKalmanKF(frames: idFixed, fps: CGFloat(analysisFPS))
-        let withCue = nudgeWristsWithClubCue(frames: wristsRefined, fps: 20)
-        let stabilized = stabilizeLowLag(frames: withCue, fps: 20)
-        let finalFrames: [(image: UIImage, joints: [Int: CGPoint])] = stabilized.isEmpty ? withCue : stabilized
-        var fused = 0
-        for i in 0..<min(idFixed.count, wristsRefined.count) {
-            let aL = idFixed[i].joints[15]; let bL = wristsRefined[i].joints[15]
-            let aR = idFixed[i].joints[16]; let bR = wristsRefined[i].joints[16]
-            let movedL = (aL != nil && bL != nil) ? (hypot(aL!.x - bL!.x, aL!.y - bL!.y) > 0.75) : false
-            let movedR = (aR != nil && bR != nil) ? (hypot(aR!.x - bR!.x, aR!.y - bR!.y) > 0.75) : false
-            if movedL || movedR { fused += 1 }
-        }
-        fusionCount = fused
-        let liftedFrames = finalFrames
+        let liftedFrames = analyzedFrames
                 await MainActor.run {
             isProcessing = false
                 analyzedFrames = liftedFrames
@@ -1072,18 +1439,19 @@ extension ContentView {
         return result
     }
     
-    // Speed-gated One Euro smoothing for non-wrist joints (avoids lag during fast motion)
-    func stabilizeLowLag(frames: [(image: UIImage, joints: [Int: CGPoint])], fps: CGFloat) -> [(image: UIImage, joints: [Int: CGPoint])] {
+    // Speed-gated One Euro smoothing for all joints, with looser gating for body and stricter for wrists
+    func stabilizeWristAware(frames: [(image: UIImage, joints: [Int: CGPoint])], fps: CGFloat) -> [(image: UIImage, joints: [Int: CGPoint])] {
         guard frames.count > 1, fps > 0 else { return frames }
         var result = frames
-        let wrists: Set<Int> = [15, 16]
+        let LWR = 15, RWR = 16
         let dt: CGFloat = 1.0 / fps
         var fx: [OneEuroFilter] = (0..<33).map { _ in OneEuroFilter(dt: dt, minCutoff: 0.7, beta: 0.02) }
         var fy: [OneEuroFilter] = (0..<33).map { _ in OneEuroFilter(dt: dt, minCutoff: 0.7, beta: 0.02) }
-        let speedBypass: CGFloat = 45
+        let speedBypassBody: CGFloat = 45
+        let speedBypassWrist: CGFloat = 55
         
         // initialize with first frame
-        for idx in 0..<33 where !wrists.contains(idx) {
+        for idx in 0..<33 {
             if let p = result[0].joints[idx] {
                 _ = fx[idx].filter(p.x)
                 _ = fy[idx].filter(p.y)
@@ -1093,10 +1461,14 @@ extension ContentView {
         for i in 1..<result.count {
             var joints = result[i].joints
             let prev = result[i-1].joints
-            for idx in 0..<33 where !wrists.contains(idx) {
+            for idx in 0..<33 {
                 guard let cur = joints[idx], let pre = prev[idx] else { continue }
                 let speed = hypot(cur.x - pre.x, cur.y - pre.y)
-                if speed > speedBypass { continue }
+                if (idx == LWR || idx == RWR) {
+                    if speed > speedBypassWrist { continue }
+                } else {
+                    if speed > speedBypassBody { continue }
+                }
                 joints[idx] = CGPoint(x: fx[idx].filter(cur.x), y: fy[idx].filter(cur.y))
             }
             result[i] = (image: result[i].image, joints: joints)
@@ -1107,6 +1479,56 @@ extension ContentView {
 
 // MARK: - Wrist-only short-gap interpolation
 extension ContentView {
+    // Wrist-only OneEuro smoother with speed bypass (body untouched)
+    func stabilizeWristsOnly(frames: [(image: UIImage, joints: [Int: CGPoint])], fps: CGFloat) -> [(image: UIImage, joints: [Int: CGPoint])] {
+        guard frames.count > 1, fps > 0 else { return frames }
+        var result = frames
+        let LW = 15, RW = 16
+        let dt: CGFloat = 1.0 / fps
+        var fxL = OneEuroFilter(dt: dt, minCutoff: 0.7, beta: 0.02)
+        var fyL = OneEuroFilter(dt: dt, minCutoff: 0.7, beta: 0.02)
+        var fxR = OneEuroFilter(dt: dt, minCutoff: 0.7, beta: 0.02)
+        var fyR = OneEuroFilter(dt: dt, minCutoff: 0.7, beta: 0.02)
+        // Tighten stability: lower bypass and clamp per-frame motion
+        let speedBypass: CGFloat = 40
+        let maxStep: CGFloat = 5
+        if let p = result[0].joints[LW] { _ = fxL.filter(p.x); _ = fyL.filter(p.y) }
+        if let p = result[0].joints[RW] { _ = fxR.filter(p.x); _ = fyR.filter(p.y) }
+        for i in 1..<result.count {
+            var j = result[i].joints
+            let prev = result[i-1].joints
+            if let cur = j[LW], let pre = prev[LW] {
+                let sp = hypot(cur.x - pre.x, cur.y - pre.y)
+                if sp <= speedBypass {
+                    let sx = fxL.filter(cur.x), sy = fyL.filter(cur.y)
+                    let dx = sx - pre.x, dy = sy - pre.y
+                    let d = hypot(dx, dy)
+                    if d > maxStep {
+                        let ux = dx / d, uy = dy / d
+                        j[LW] = CGPoint(x: pre.x + ux * maxStep, y: pre.y + uy * maxStep)
+                    } else {
+                        j[LW] = CGPoint(x: sx, y: sy)
+                    }
+                }
+            }
+            if let cur = j[RW], let pre = prev[RW] {
+                let sp = hypot(cur.x - pre.x, cur.y - pre.y)
+                if sp <= speedBypass {
+                    let sx = fxR.filter(cur.x), sy = fyR.filter(cur.y)
+                    let dx = sx - pre.x, dy = sy - pre.y
+                    let d = hypot(dx, dy)
+                    if d > maxStep {
+                        let ux = dx / d, uy = dy / d
+                        j[RW] = CGPoint(x: pre.x + ux * maxStep, y: pre.y + uy * maxStep)
+                    } else {
+                        j[RW] = CGPoint(x: sx, y: sy)
+                    }
+                }
+            }
+            result[i] = (image: result[i].image, joints: j)
+        }
+        return result
+    }
     func fillWristGaps(frames: [(image: UIImage, joints: [Int: CGPoint])], maxGap: Int) -> [(image: UIImage, joints: [Int: CGPoint])] {
         guard frames.count > 2, maxGap > 0 else { return frames }
         var result = frames
@@ -1352,7 +1774,7 @@ extension ContentView {
             // Predict
             kfL?.predict(); kfR?.predict()
             // Measurements from hand anchors
-            func measure(from w: CGPoint?) -> CGPoint? {
+            func measure(from w: CGPoint?, preferLeft: Bool) -> CGPoint? {
                 guard let w else { return nil }
                 let roi = CGRect(x: w.x - roiRadius, y: w.y - roiRadius, width: roiRadius*2, height: roiRadius*2)
                 let hands = handWrapper.detectHandLandmarks(in: result[i].image, roi: roi)
@@ -1367,18 +1789,26 @@ extension ContentView {
                     for idx in pick { let p = hd.landmarks[idx]; sx += p.x; sy += p.y }
                     let c = CGFloat(pick.count)
                     let anchor = CGPoint(x: sx/c, y: sy/c)
-                    let d = hypot(anchor.x - w.x, anchor.y - w.y)
+                    // Prefer correct side if available
+                    let sidePenalty: CGFloat = {
+                        switch hd.side {
+                        case .left: return preferLeft ? 0 : 12
+                        case .right: return preferLeft ? 12 : 0
+                        case .unknown: return 6
+                        }
+                    }()
+                    let d = hypot(anchor.x - w.x, anchor.y - w.y) + sidePenalty
                     if d < bestD { bestD = d; best = anchor }
                 }
                 guard let anchor = best, bestD < acceptRadius else { return nil }
                 return anchor
             }
-            if vL < speedBypass, let w = curL, let meas = measure(from: w) {
+            if vL < speedBypass, let w = curL, let meas = measure(from: w, preferLeft: true) {
                 let noise = baseMeasVar * max(1, vL / 70)
                 kfL?.update(measurement: meas, measurementVariance: noise)
                 joints[L] = kfL?.currentPosition()
             }
-            if vR < speedBypass, let w = curR, let meas = measure(from: w) {
+            if vR < speedBypass, let w = curR, let meas = measure(from: w, preferLeft: false) {
                 let noise = baseMeasVar * max(1, vR / 70)
                 kfR?.update(measurement: meas, measurementVariance: noise)
                 joints[R] = kfR?.currentPosition()
@@ -1425,6 +1855,8 @@ extension ContentView {
         return result
     }
 }
+
+// (Removed final wrist-only Kalman smoother per user request)
 
 // Removed elbow/knee refinement per user request
 

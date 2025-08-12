@@ -94,8 +94,10 @@ final class HandLandmarkerWrapper {
         }
     }
 
+    enum HandSide { case left, right, unknown }
     struct HandDetection {
         let landmarks: [CGPoint] // 21 hand landmarks in image coordinates
+        let side: HandSide       // rough handedness from 2D geometry
     }
 
     // Returns full 21-point landmarks for each detected hand in the ROI, mapped to full image coordinates
@@ -119,13 +121,28 @@ final class HandLandmarkerWrapper {
                     let global = CGPoint(x: local.x + clamped.origin.x, y: local.y + clamped.origin.y)
                     pts.append(global)
                 }
-                detections.append(HandDetection(landmarks: pts))
+                let side = estimateSide(landmarks: pts)
+                detections.append(HandDetection(landmarks: pts, side: side))
             }
             return detections
         } catch {
             print("HandLandmarker detectHandLandmarks(roi) failed: \(error)")
             return []
         }
+    }
+
+    // Heuristic handedness from 2D landmarks
+    private func estimateSide(landmarks: [CGPoint]) -> HandSide {
+        guard landmarks.count > 17 else { return .unknown }
+        let wrist = landmarks[0]
+        let indexMCP = landmarks[5]
+        let pinkyMCP = landmarks[17]
+        let v1 = CGPoint(x: indexMCP.x - wrist.x, y: indexMCP.y - wrist.y)
+        let v2 = CGPoint(x: pinkyMCP.x - wrist.x, y: pinkyMCP.y - wrist.y)
+        let crossZ = v1.x * v2.y - v1.y * v2.x // y-down coords
+        if crossZ > 0 { return .right }
+        if crossZ < 0 { return .left }
+        return .unknown
     }
 
     private func crop(image: UIImage, to rect: CGRect) -> UIImage? {
